@@ -1,0 +1,167 @@
+import os
+import json
+import time
+import asyncio
+import requests
+import websockets
+import logging
+from collections import defaultdict
+from dotenv import load_dotenv
+from flask import Flask
+import threading
+
+
+# ================== LOGGING ==================
+logging.basicConfig(
+    
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[logging.FileHandler("rekt_bot.log", encoding="utf-8")]
+    
+)
+log = logging.getLogger("REKT_BOT")
+
+# ================== CONFIG ==================
+load_dotenv()
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
+TG_CHAT_ID = os.getenv("TG_CHAT_ID")
+MIN_LIQ_USD = float(os.getenv("MIN_LIQ_USD", 10))
+CLUSTER_WINDOW = int(os.getenv("CLUSTER_WINDOW", 10))
+
+BINANCE_LIQ_WS = "wss://fstream.binance.com/ws/!forceOrder@arr"
+
+# ================== FLASK (для Render) ==================
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "REKT BOT is running"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+
+# ================== TELEGRAM ==================
+def send_alert(text: str):
+    try:
+        url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}
+        requests.post(url, json=payload, timeout=5)
+    except Exception as e:
+        log.error(f"Telegram error: {e}")
+
+# ================== OI + FUNDING ==================
+def binance_oi_funding(symbol):
+    try:
+        base = "https://fapi.binance.com"
+
+        oi = requests.get(
+            f"{base}/futures/data/openInterestHist",
+            params={"symbol": symbol, "period": "5m", "limit": 2},
+            timeout=5
+        ).json()
+
+        funding = requests.get(
+            f"{base}/fapi/v1/fundingRate",
+            params={"symbol": symbol, "limit": 1},
+            timeout=5
+        ).json()
+
+        if len(oi) < 2:
+            return 0, 0
+
+        oi_change = (
+            (float(oi[-1]["sumOpenInterest"]) - float(oi[-2]["sumOpenInterest"]))
+            / float(oi[-2]["sumOpenInterest"]) * 100
+        )
+
+        return oi_change, float(funding[0]["fundingRate"])
+    except:
+        return 0, 0
+
+# ================== CLASSIFIER ==================
+def priority_label(total, oi, funding):
+    score = 0
+    if total > 5_000_000: score += 2
+    if abs(oi) > 5: score += 2
+    if abs(funding) > 0.05: score += 1
+    return ["⚠️ LOW", "🟢 MEDIUM", "🔴 HIGH", "💀 MAX"][min(score, 3)]
+
+def classify_and_alert(symbol, side, total, price):
+    oi, funding = binance_oi_funding(symbol)
+
+    if abs(oi) < 2 and abs(funding) < 0.02:
+        return
+
+    mm = "🔴 POSITION BUILD-UP" if oi > 3 else "🟢 POSITION CLOSE" if oi < -3 else "⚪ UNCLEAR"
+    priority = priority_label(total, oi, funding)
+
+    msg = f"""
+💀 <b>REKT ALERT</b> {priority}
+
+<b>{symbol}</b>
+Side: {side}
+Price: {price}
+
+💰 Size: ${total:,.0f}
+📊 OI: {oi:.2f}%
+💸 Funding: {funding:.4f}
+
+🧠 MM: <b>{mm}</b>
+"""
+    send_alert(msg)
+
+# ================== AGGREGATOR ==================
+clusters = defaultdict(list)
+
+def process_liquidation(symbol, side, usd_size, price):
+    if usd_size < MIN_LIQ_USD:
+        return
+
+    now = time.time()
+    clusters[symbol].append((now, usd_size, side, price))
+    clusters[symbol] = [x for x in clusters[symbol] if now - x[0] <= CLUSTER_WINDOW]
+
+    total = sum(x[1] for x in clusters[symbol])
+
+    if total >= MIN_LIQ_USD * 4:
+        classify_and_alert(symbol, side, total, price)
+        clusters[symbol].clear()
+
+# ================== BINANCE WS ==================
+async def binance_ws():
+    while True:
+        try:
+            async with websockets.connect(BINANCE_LIQ_WS) as ws:
+                async for raw in ws:
+                    data = json.loads(raw)
+                    events = [data] if isinstance(data, dict) else data
+
+                    for e in events:
+                        if "o" not in e:
+                            continue
+
+                        o = e["o"]
+                        symbol = o["s"]
+
+                        if symbol.startswith(("BTC", "ETH")):
+                            continue
+
+                        usd = float(o["ap"]) * float(o["q"])
+                        side = "LONG" if o["S"] == "SELL" else "SHORT"
+
+                        process_liquidation(symbol, side, usd, float(o["ap"]))
+        except:
+            await asyncio.sleep(5)
+
+# ================== MAIN ==================
+def run_bot():
+    asyncio.run(binance_ws())
+
+if __name__ == "__main__":
+    threading.Thread(target=run_bot).start()
+    run_flask()
+    send_alert("TEST MESSAGE FROM BOT")
+
+   
+
