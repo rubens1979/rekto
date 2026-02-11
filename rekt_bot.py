@@ -5,48 +5,55 @@ import asyncio
 import requests
 import websockets
 import logging
+import threading
 from collections import defaultdict
 from dotenv import load_dotenv
-from flask import Flask
-import threading
-
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # ================== LOGGING ==================
 logging.basicConfig(
-    
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
-    handlers=[logging.FileHandler("rekt_bot.log", encoding="utf-8")]
-    
+    handlers=[logging.StreamHandler()]
 )
 log = logging.getLogger("REKT_BOT")
 
 # ================== CONFIG ==================
 load_dotenv()
+
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID")
-MIN_LIQ_USD = float(os.getenv("MIN_LIQ_USD", 10))
-CLUSTER_WINDOW = int(os.getenv("CLUSTER_WINDOW", 10))
+
+MIN_LIQ_USD = float(os.getenv("MIN_LIQ_USD", 30))
+CLUSTER_WINDOW = int(os.getenv("CLUSTER_WINDOW", 100))
 
 BINANCE_LIQ_WS = "wss://fstream.binance.com/ws/!forceOrder@arr"
 
-# ================== FLASK (для Render) ==================
-app = Flask(__name__)
+# ================== HTTP SERVER (для Render) ==================
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"REKT BOT is running")
 
-@app.route("/")
-def home():
-    return "REKT BOT is running"
-
-def run_flask():
+def run_http():
     port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    server = HTTPServer(("0.0.0.0", port), Handler)
+    log.info(f"HTTP server running on port {port}")
+    server.serve_forever()
 
 # ================== TELEGRAM ==================
 def send_alert(text: str):
     try:
         url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-        payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}
-        requests.post(url, json=payload, timeout=5)
+        payload = {
+            "chat_id": TG_CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML"
+        }
+        r = requests.post(url, json=payload, timeout=5)
+        log.info(f"Telegram response: {r.status_code} | {r.text}")
     except Exception as e:
         log.error(f"Telegram error: {e}")
 
@@ -71,35 +78,46 @@ def binance_oi_funding(symbol):
             return 0, 0
 
         oi_change = (
-            (float(oi[-1]["sumOpenInterest"]) - float(oi[-2]["sumOpenInterest"]))
+            (float(oi[-1]["sumOpenInterest"]) -
+             float(oi[-2]["sumOpenInterest"]))
             / float(oi[-2]["sumOpenInterest"]) * 100
         )
 
         return oi_change, float(funding[0]["fundingRate"])
-    except:
+    except Exception as e:
+        log.error(f"Binance OI/Funding error {symbol}: {e}")
         return 0, 0
 
 # ================== CLASSIFIER ==================
 def priority_label(total, oi, funding):
     score = 0
-    if total > 5_000_000: score += 2
-    if abs(oi) > 5: score += 2
-    if abs(funding) > 0.05: score += 1
+    if total > 5_000_000:
+        score += 2
+    if abs(oi) > 5:
+        score += 2
+    if abs(funding) > 0.05:
+        score += 1
     return ["⚠️ LOW", "🟢 MEDIUM", "🔴 HIGH", "💀 MAX"][min(score, 3)]
 
 def classify_and_alert(symbol, side, total, price):
     oi, funding = binance_oi_funding(symbol)
 
     if abs(oi) < 2 and abs(funding) < 0.02:
+        log.info(f"Filtered {symbol}: OI={oi:.2f}% Funding={funding:.4f}")
         return
 
-    mm = "🔴 POSITION BUILD-UP" if oi > 3 else "🟢 POSITION CLOSE" if oi < -3 else "⚪ UNCLEAR"
+    mm = (
+        "🔴 POSITION BUILD-UP" if oi > 3 else
+        "🟢 POSITION CLOSE" if oi < -3 else
+        "⚪ UNCLEAR"
+    )
+
     priority = priority_label(total, oi, funding)
 
     msg = f"""
 💀 <b>REKT ALERT</b> {priority}
 
-<b>{symbol}</b>
+<b>{symbol}</b> (Binance)
 Side: {side}
 Price: {price}
 
@@ -109,6 +127,7 @@ Price: {price}
 
 🧠 MM: <b>{mm}</b>
 """
+    log.info(f"{symbol} | {priority} | {mm}")
     send_alert(msg)
 
 # ================== AGGREGATOR ==================
@@ -125,6 +144,7 @@ def process_liquidation(symbol, side, usd_size, price):
     total = sum(x[1] for x in clusters[symbol])
 
     if total >= MIN_LIQ_USD * 4:
+        log.info(f"Cluster {symbol} ${total:,.0f}")
         classify_and_alert(symbol, side, total, price)
         clusters[symbol].clear()
 
@@ -132,7 +152,10 @@ def process_liquidation(symbol, side, usd_size, price):
 async def binance_ws():
     while True:
         try:
-            async with websockets.connect(BINANCE_LIQ_WS) as ws:
+            log.info("Connecting to Binance WS...")
+            async with websockets.connect(BINANCE_LIQ_WS, ping_interval=20) as ws:
+                log.info("Binance WS connected")
+
                 async for raw in ws:
                     data = json.loads(raw)
                     events = [data] if isinstance(data, dict) else data
@@ -150,18 +173,24 @@ async def binance_ws():
                         usd = float(o["ap"]) * float(o["q"])
                         side = "LONG" if o["S"] == "SELL" else "SHORT"
 
-                        process_liquidation(symbol, side, usd, float(o["ap"]))
-        except:
+                        process_liquidation(
+                            symbol,
+                            side,
+                            usd,
+                            float(o["ap"])
+                        )
+
+        except Exception as e:
+            log.error(f"Binance WS error: {e}")
             await asyncio.sleep(5)
 
 # ================== MAIN ==================
 def run_bot():
-    asyncio.run(binance_ws())
+    log.info("BOT THREAD STARTED")
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(binance_ws())
 
 if __name__ == "__main__":
-    threading.Thread(target=run_bot).start()
-    run_flask()
-    send_alert("TEST MESSAGE FROM BOT")
-
-   
-
+    threading.Thread(target=run_bot, daemon=True).start()
+    run_http()
