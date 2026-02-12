@@ -2,13 +2,11 @@ import os
 import json
 import time
 import asyncio
-import requests
-import websockets
+import aiohttp
 import logging
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from collections import defaultdict
 from dotenv import load_dotenv
+from aiohttp import web
 
 # ================== LOGGING ==================
 logging.basicConfig(
@@ -22,111 +20,96 @@ load_dotenv()
 
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID")
-
-MIN_LIQ_USD = float(os.getenv("MIN_LIQ_USD", 30))
-CLUSTER_WINDOW = int(os.getenv("CLUSTER_WINDOW", 100))
+MIN_LIQ_USD = float(os.getenv("MIN_LIQ_USD", 100))
+CLUSTER_WINDOW = int(os.getenv("CLUSTER_WINDOW", 60))
 
 BINANCE_LIQ_WS = "wss://fstream.binance.com/ws/!forceOrder@arr"
 
+# Реалистичный заголовок браузера
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (rekt-bot)"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Accept": "application/json"
 }
 
 # ================== TELEGRAM ==================
-def send_alert(text: str):
+async def send_alert(text: str):
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}
     try:
-        url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TG_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML"
-        }
-        r = requests.post(url, json=payload, timeout=5)
-        log.info(f"Telegram response: {r.status_code} | {r.text}")
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, timeout=5) as r:
+                return await r.json()
     except Exception as e:
         log.error(f"Telegram error: {e}")
 
-# ================== BYBIT OI ==================
-def bybit_oi(symbol):
+# ================== BYBIT OI (ASYNC) ==================
+async def get_bybit_oi(symbol):
+    url = "https://api.bybit.com/v5/market/open-interest"
+    params = {"category": "linear", "symbol": symbol, "intervalTime": "5min", "limit": 2}
+    
     try:
-        url = "https://api.bybit.com/v5/market/open-interest"
-        params = {
-            "category": "linear",
-            "symbol": symbol,
-            "intervalTime": "5min",
-            "limit": 2
-        }
+        async with aiohttp.ClientSession(headers=HEADERS) as session:
+            async with session.get(url, params=params, timeout=5) as r:
+                if r.status != 200:
+                    log.error(f"Bybit API error {r.status} for {symbol}")
+                    return None
+                
+                data = await r.json()
+                if data.get("retCode") != 0:
+                    return None
 
-        r = requests.get(url, params=params, headers=HEADERS, timeout=5).json()
+                points = data["result"]["list"]
+                if len(points) < 2: return None
 
-        if r.get("retCode") != 0:
-            log.error(f"Bybit OI error {symbol}: {r}")
-            return None
-
-        data = r["result"]["list"]
-        if len(data) < 2:
-            return None
-
-        oi_now = float(data[0]["openInterest"])
-        oi_prev = float(data[1]["openInterest"])
-
-        oi_change = (oi_now - oi_prev) / oi_prev * 100
-        return oi_change
-
+                oi_now = float(points[0]["openInterest"])
+                oi_prev = float(points[1]["openInterest"])
+                return (oi_now - oi_prev) / oi_prev * 100
     except Exception as e:
-        log.error(f"Bybit OI exception {symbol}: {e}")
+        log.error(f"OI Fetch exception: {e}")
         return None
 
-# ================== CLASSIFIER ==================
-def priority_label(total, oi):
+# ================== LOGIC ==================
+def priority_label(total, oi_val):
     score = 0
-    if total > 5_000_000:
-        score += 2
-    if abs(oi) > 5:
-        score += 2
+    if total > 500_000: score += 1
+    if total > 2_000_000: score += 1
+    if abs(oi_val) > 4: score += 1
     return ["⚠️ LOW", "🟢 MEDIUM", "🔴 HIGH", "💀 MAX"][min(score, 3)]
 
-def classify_and_alert(symbol, side, total, price):
-    oi = bybit_oi(symbol)
+async def classify_and_alert(symbol, side, total, price):
+    oi = await get_bybit_oi(symbol)
+    
+    # Бот не молчит при ошибке, а пишет N/A
+    oi_str = f"{oi:+.2f}%" if oi is not None else "⚠️ N/A"
+    oi_val = oi if oi is not None else 0
+    
+    mm = "⚪ UNKNOWN"
+    if oi is not None:
+        mm = "🔴 POS BUILD-UP" if oi > 2 else "🟢 POS CLOSE" if oi < -2 else "⚪ SIDEWAYS"
 
-    # ❌ если нет OI — не шлём
-    if oi is None:
-        log.info(f"No OI data for {symbol}, skipping alert")
-        return
-
-    if abs(oi) < 2:
-        log.info(f"Filtered {symbol}: OI={oi:.2f}%")
-        return
-
-    mm = (
-        "🔴 POSITION BUILD-UP" if oi > 3 else
-        "🟢 POSITION CLOSE" if oi < -3 else
-        "⚪ UNCLEAR"
-    )
-
-    priority = priority_label(total, oi)
+    priority = priority_label(total, oi_val)
+    side_emoji = "🟢 LONG" if side == "LONG" else "🔴 SHORT"
 
     msg = f"""
-💀 <b>REKT ALERT</b> {priority}
+{priority} <b>REKT ALERT</b>
 
 <b>{symbol}</b>
-Side: {side}
-Price: {price}
+Side: {side_emoji}
+Price: {price:,.4f}
 
-💰 Size: ${total:,.0f}
-📊 OI (Bybit): {oi:.2f}%
+💰 Size: <b>${total:,.0f}</b>
+📊 OI Change: <code>{oi_str}</code>
 
 🧠 MM: <b>{mm}</b>
 """
-    log.info(f"{symbol} | {priority} | {mm}")
-    send_alert(msg)
+    log.info(f"Signal sent: {symbol} ${total:,.0f}")
+    await send_alert(msg)
 
 # ================== AGGREGATOR ==================
 clusters = defaultdict(list)
 
-def process_liquidation(symbol, side, usd_size, price):
-    if usd_size < MIN_LIQ_USD:
-        return
+async def process_liquidation(symbol, side, usd_size, price):
+    if usd_size < MIN_LIQ_USD: return
 
     now = time.time()
     clusters[symbol].append((now, usd_size, side, price))
@@ -134,9 +117,9 @@ def process_liquidation(symbol, side, usd_size, price):
 
     total = sum(x[1] for x in clusters[symbol])
 
-    if total >= MIN_LIQ_USD * 4:
-        log.info(f"Cluster {symbol} ${total:,.0f}")
-        classify_and_alert(symbol, side, total, price)
+    if total >= MIN_LIQ_USD * 3:
+        # Запускаем в фоне, чтобы не тормозить WS
+        asyncio.create_task(classify_and_alert(symbol, side, total, price))
         clusters[symbol].clear()
 
 # ================== BINANCE WS ==================
@@ -144,58 +127,46 @@ async def binance_ws():
     while True:
         try:
             log.info("Connecting to Binance WS...")
-            async with websockets.connect(BINANCE_LIQ_WS) as ws:
-                log.info("Binance WS connected")
+            async with aiohttp.ClientSession() as session:
+                async with session.ws_connect(BINANCE_LIQ_WS) as ws:
+                    log.info("Binance WS connected")
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            data = json.loads(msg.data)
+                            o = data.get("o", {})
+                            symbol = o.get("s")
+                            if not symbol or symbol.startswith(("BTC", "ETH")): continue
 
-                async for raw in ws:
-                    data = json.loads(raw)
-                    events = [data] if isinstance(data, dict) else data
-
-                    for e in events:
-                        if "o" not in e:
-                            continue
-
-                        o = e["o"]
-                        symbol = o["s"]
-
-                        if symbol.startswith(("BTC", "ETH")):
-                            continue
-
-                        usd = float(o["ap"]) * float(o["q"])
-                        side = "LONG" if o["S"] == "SELL" else "SHORT"
-
-                        process_liquidation(
-                            symbol,
-                            side,
-                            usd,
-                            float(o["ap"])
-                        )
-
+                            usd = float(o["ap"]) * float(o["q"])
+                            side = "LONG" if o["S"] == "SELL" else "SHORT"
+                            await process_liquidation(symbol, side, usd, float(o["ap"]))
         except Exception as e:
-            log.error(f"Binance WS error: {e}")
+            log.error(f"WS error: {e}")
             await asyncio.sleep(5)
 
-# ================== HTTP SERVER (for Render) ==================
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"REKT BOT RUNNING")
+# ================== WEB SERVER (Render Port Binding) ==================
+async def handle_ping(request):
+    return web.Response(text="BOT ACTIVE", status=200)
 
-def run_http():
+async def run_server():
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
     port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), Handler)
-    log.info(f"HTTP server running on port {port}")
-    server.serve_forever()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    log.info(f"HTTP Server started on port {port}")
+    await site.start()
 
 # ================== MAIN ==================
-def run_bot():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(binance_ws())
+async def main():
+    await asyncio.gather(
+        run_server(),
+        binance_ws()
+    )
 
 if __name__ == "__main__":
-    log.info("BOT THREAD STARTED")
-    threading.Thread(target=run_bot, daemon=True).start()
-    run_http()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
