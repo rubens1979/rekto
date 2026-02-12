@@ -46,35 +46,39 @@ def send_alert(text: str):
     except Exception as e:
         log.error(f"Telegram error: {e}")
 
-# ================== BYBIT OI ==================
-def bybit_oi(symbol):
+# ================== OKX OI ==================
+def okx_oi(symbol):
     try:
-        url = "https://api.bybit.com/v5/market/open-interest"
+        inst = symbol.replace("USDT", "-USDT-SWAP")
+
+        url = "https://www.okx.com/api/v5/public/open-interest"
         params = {
-            "category": "linear",
-            "symbol": symbol,
-            "intervalTime": "5min",
-            "limit": 2
+            "instType": "SWAP",
+            "instId": inst
         }
 
-        r = requests.get(url, params=params, headers=HEADERS, timeout=5).json()
+        r = requests.get(url, params=params, headers=HEADERS, timeout=5)
+        data = r.json()
 
-        if r.get("retCode") != 0:
-            log.error(f"Bybit OI error {symbol}: {r}")
+        if data.get("code") != "0":
+            log.error(f"OKX OI error {symbol}: {data}")
             return None
 
-        data = r["result"]["list"]
-        if len(data) < 2:
+        lst = data.get("data", [])
+        if len(lst) < 2:
             return None
 
-        oi_now = float(data[0]["openInterest"])
-        oi_prev = float(data[1]["openInterest"])
+        oi_now = float(lst[0]["oi"])
+        oi_prev = float(lst[1]["oi"])
+
+        if oi_prev == 0:
+            return None
 
         oi_change = (oi_now - oi_prev) / oi_prev * 100
         return oi_change
 
     except Exception as e:
-        log.error(f"Bybit OI exception {symbol}: {e}")
+        log.error(f"OKX OI exception {symbol}: {e}")
         return None
 
 # ================== CLASSIFIER ==================
@@ -87,7 +91,7 @@ def priority_label(total, oi):
     return ["⚠️ LOW", "🟢 MEDIUM", "🔴 HIGH", "💀 MAX"][min(score, 3)]
 
 def classify_and_alert(symbol, side, total, price):
-    oi = bybit_oi(symbol)
+    oi = okx_oi(symbol)
 
     # ❌ если нет OI — не шлём
     if oi is None:
@@ -114,7 +118,7 @@ Side: {side}
 Price: {price}
 
 💰 Size: ${total:,.0f}
-📊 OI (Bybit): {oi:.2f}%
+📊 OI (OKX): {oi:.2f}%
 
 🧠 MM: <b>{mm}</b>
 """
