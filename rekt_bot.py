@@ -42,9 +42,33 @@ def send_alert(text: str):
             "parse_mode": "HTML"
         }
         r = requests.post(url, json=payload, timeout=5)
-        log.info(f"Telegram response: {r.status_code} | {r.text}")
+        log.info(f"Telegram response: {r.status_code}")
     except Exception as e:
         log.error(f"Telegram error: {e}")
+
+# ================== LOAD OKX SYMBOLS ==================
+OKX_SYMBOLS = set()
+
+def load_okx_symbols():
+    global OKX_SYMBOLS
+    try:
+        url = "https://www.okx.com/api/v5/public/instruments"
+        params = {"instType": "SWAP"}
+        r = requests.get(url, params=params, headers=HEADERS, timeout=10).json()
+
+        if r.get("code") != "0":
+            log.error(f"Failed to load OKX instruments: {r}")
+            return
+
+        for item in r["data"]:
+            if item["instId"].endswith("-USDT-SWAP"):
+                sym = item["instId"].replace("-USDT-SWAP", "") + "USDT"
+                OKX_SYMBOLS.add(sym)
+
+        log.info(f"Loaded {len(OKX_SYMBOLS)} OKX symbols")
+
+    except Exception as e:
+        log.error(f"Error loading OKX symbols: {e}")
 
 # ================== OKX OI ==================
 def okx_oi(symbol):
@@ -57,14 +81,12 @@ def okx_oi(symbol):
             "instId": inst
         }
 
-        r = requests.get(url, params=params, headers=HEADERS, timeout=5)
-        data = r.json()
+        r = requests.get(url, params=params, headers=HEADERS, timeout=5).json()
 
-        if data.get("code") != "0":
-            log.error(f"OKX OI error {symbol}: {data}")
+        if r.get("code") != "0":
             return None
 
-        lst = data.get("data", [])
+        lst = r.get("data", [])
         if len(lst) < 2:
             return None
 
@@ -74,11 +96,9 @@ def okx_oi(symbol):
         if oi_prev == 0:
             return None
 
-        oi_change = (oi_now - oi_prev) / oi_prev * 100
-        return oi_change
+        return (oi_now - oi_prev) / oi_prev * 100
 
-    except Exception as e:
-        log.error(f"OKX OI exception {symbol}: {e}")
+    except Exception:
         return None
 
 # ================== CLASSIFIER ==================
@@ -91,11 +111,12 @@ def priority_label(total, oi):
     return ["⚠️ LOW", "🟢 MEDIUM", "🔴 HIGH", "💀 MAX"][min(score, 3)]
 
 def classify_and_alert(symbol, side, total, price):
+    if symbol not in OKX_SYMBOLS:
+        return
+
     oi = okx_oi(symbol)
 
-    # ❌ если нет OI — не шлём
     if oi is None:
-        log.info(f"No OI data for {symbol}, skipping alert")
         return
 
     if abs(oi) < 2:
@@ -168,18 +189,13 @@ async def binance_ws():
                         usd = float(o["ap"]) * float(o["q"])
                         side = "LONG" if o["S"] == "SELL" else "SHORT"
 
-                        process_liquidation(
-                            symbol,
-                            side,
-                            usd,
-                            float(o["ap"])
-                        )
+                        process_liquidation(symbol, side, usd, float(o["ap"]))
 
         except Exception as e:
             log.error(f"Binance WS error: {e}")
             await asyncio.sleep(5)
 
-# ================== HTTP SERVER (for Render) ==================
+# ================== HTTP SERVER ==================
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -200,6 +216,9 @@ def run_bot():
     loop.run_until_complete(binance_ws())
 
 if __name__ == "__main__":
+    log.info("LOADING OKX SYMBOLS...")
+    load_okx_symbols()
+
     log.info("BOT THREAD STARTED")
     threading.Thread(target=run_bot, daemon=True).start()
     run_http()
