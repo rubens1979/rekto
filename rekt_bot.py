@@ -46,8 +46,8 @@ def send_alert(text: str):
     except Exception as e:
         log.error(f"Telegram error: {e}")
 
-# ================== OI + FUNDING ==================
-def binance_oi_funding(symbol):
+# ================== OI ONLY (NO FUNDING) ==================
+def binance_oi(symbol):
     try:
         base = "https://fapi.binance.com"
 
@@ -58,19 +58,10 @@ def binance_oi_funding(symbol):
             timeout=5
         ).json()
 
-        funding = requests.get(
-            f"{base}/fapi/v1/fundingRate",
-            params={"symbol": symbol, "limit": 1},
-            headers=HEADERS,
-            timeout=5
-        ).json()
-
-        # DEBUG (можешь убрать позже)
         log.info(f"RAW OI {symbol}: {oi}")
-        log.info(f"RAW FUNDING {symbol}: {funding}")
 
         if not isinstance(oi, list) or len(oi) < 2:
-            return None, None
+            return None
 
         oi_change = (
             (float(oi[-1]["sumOpenInterest"]) -
@@ -78,42 +69,31 @@ def binance_oi_funding(symbol):
             / float(oi[-2]["sumOpenInterest"]) * 100
         )
 
-        funding_rate = None
-        if isinstance(funding, list) and len(funding) > 0:
-            funding_rate = float(funding[0]["fundingRate"])
-
-        return oi_change, funding_rate
+        return oi_change
 
     except Exception as e:
-        log.error(f"Binance OI/Funding error {symbol}: {e}")
-        return None, None
+        log.error(f"Binance OI error {symbol}: {e}")
+        return None
 
 # ================== CLASSIFIER ==================
-def priority_label(total, oi, funding):
+def priority_label(total, oi):
     score = 0
     if total > 5_000_000:
         score += 2
     if abs(oi) > 5:
         score += 2
-    if abs(funding) > 0.05:
-        score += 1
     return ["⚠️ LOW", "🟢 MEDIUM", "🔴 HIGH", "💀 MAX"][min(score, 3)]
 
 def classify_and_alert(symbol, side, total, price):
-    oi, funding = binance_oi_funding(symbol)
+    oi = binance_oi(symbol)
 
     # ❌ если нет OI — не шлём
     if oi is None:
         log.info(f"No OI data for {symbol}, skipping alert")
         return
 
-    # ❌ если нет funding — не шлём
-    if funding is None:
-        log.info(f"No funding data for {symbol}, skipping alert")
-        return
-
-    if abs(oi) < 2 and abs(funding) < 0.02:
-        log.info(f"Filtered {symbol}: OI={oi:.2f}% Funding={funding:.4f}")
+    if abs(oi) < 2:
+        log.info(f"Filtered {symbol}: OI={oi:.2f}%")
         return
 
     mm = (
@@ -122,7 +102,7 @@ def classify_and_alert(symbol, side, total, price):
         "⚪ UNCLEAR"
     )
 
-    priority = priority_label(total, oi, funding)
+    priority = priority_label(total, oi)
 
     msg = f"""
 💀 <b>REKT ALERT</b> {priority}
@@ -133,7 +113,6 @@ Price: {price}
 
 💰 Size: ${total:,.0f}
 📊 OI: {oi:.2f}%
-💸 Funding: {funding:.4f}
 
 🧠 MM: <b>{mm}</b>
 """
