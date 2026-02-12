@@ -25,7 +25,6 @@ CLUSTER_WINDOW = int(os.getenv("CLUSTER_WINDOW", 60))
 OI_CACHE_TTL = int(os.getenv("OI_CACHE_TTL", 30))
 
 BINANCE_LIQ_WS = "wss://fstream.binance.com/ws/!forceOrder@arr"
-BINANCE_FUNDING_WS = "wss://fstream.binance.com/ws/!markPrice@arr"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -36,7 +35,6 @@ HEADERS = {
 # ================== GLOBAL RESOURCES ==================
 _http_session = None
 _oi_cache = {}
-_funding_cache = {}
 
 # ================== SESSION MANAGEMENT ==================
 async def get_http_session():
@@ -58,6 +56,15 @@ async def close_http_session():
         _http_session = None
 
 # ================== BINANCE OI ==================
+def format_symbol_for_binance(symbol):
+    """Конвертирует символ в формат Binance (USDT или USD)"""
+    if symbol.endswith('USDT'):
+        return symbol
+    elif symbol.endswith('USD'):
+        return symbol
+    else:
+        return f"{symbol}USDT"
+
 async def get_binance_oi(symbol):
     """Получение Open Interest с Binance"""
     now = time.time()
@@ -68,40 +75,53 @@ async def get_binance_oi(symbol):
         if now - timestamp < OI_CACHE_TTL:
             return value
     
+    binance_symbol = format_symbol_for_binance(symbol)
+    
     try:
         session = await get_http_session()
+        
+        # Текущий OI
         url = "https://fapi.binance.com/fapi/v1/openInterest"
-        params = {"symbol": symbol}
+        params = {"symbol": binance_symbol}
         
         async with session.get(url, params=params) as r:
             if r.status != 200:
+                log.debug(f"OI no data for {binance_symbol}")
+                _oi_cache[symbol] = (None, now)
                 return None
             
             data = await r.json()
-            oi = float(data["openInterest"])
-            
-            # Нужно предыдущее значение для расчета изменения
-            # Получаем исторические данные
-            hist_url = "https://fapi.binance.com/futures/data/openInterestHist"
-            hist_params = {"symbol": symbol, "period": "5m", "limit": 2}
-            
-            async with session.get(hist_url, params=hist_params) as hr:
-                if hr.status == 200:
-                    hist_data = await hr.json()
-                    if len(hist_data) >= 2:
-                        oi_prev = float(hist_data[1]["sumOpenInterest"])
-                        oi_change = (oi - oi_prev) / oi_prev * 100
-                    else:
-                        oi_change = 0
-                else:
-                    oi_change = 0
-            
-            result = {"value": oi, "change": oi_change}
-            _oi_cache[symbol] = (result, now)
-            return result
-            
+            oi_current = float(data["openInterest"])
+        
+        # Исторический OI для расчета изменения
+        hist_url = "https://fapi.binance.com/futures/data/openInterestHist"
+        hist_params = {
+            "symbol": binance_symbol, 
+            "period": "5m", 
+            "limit": 2
+        }
+        
+        oi_change = 0
+        async with session.get(hist_url, params=hist_params) as hr:
+            if hr.status == 200:
+                hist_data = await hr.json()
+                if len(hist_data) >= 2:
+                    oi_prev = float(hist_data[1]["sumOpenInterest"])
+                    if oi_prev > 0:
+                        oi_change = (oi_current - oi_prev) / oi_prev * 100
+        
+        result = {
+            "symbol": binance_symbol,
+            "value": oi_current,
+            "change": round(oi_change, 2)
+        }
+        
+        _oi_cache[symbol] = (result, now)
+        return result
+        
     except Exception as e:
-        log.debug(f"OI error for {symbol}: {e}")
+        log.debug(f"OI error {symbol}: {e}")
+        _oi_cache[symbol] = (None, now)
         return None
 
 # ================== PRIORITY & MM ==================
@@ -111,21 +131,25 @@ def priority_label(total, oi_change=None):
     score = 0
     if total > 500_000: score += 1
     if total > 2_000_000: score += 1
+    if total > 5_000_000: score += 1
     if oi_change and abs(oi_change) > 5: score += 1
     return PRIORITY_LABELS[min(score, 3)]
 
-def get_mm_label(oi_data):
-    if not oi_data:
-        return "⚪ NO DATA"
-    change = oi_data["change"]
-    if change > 5:
-        return "🔴 AGGRESSIVE LONG"
-    if change > 2:
-        return "🟡 LONG BUILD-UP"
-    if change < -5:
-        return "🔵 AGGRESSIVE SHORT"
-    if change < -2:
-        return "🟣 SHORT BUILD-UP"
+def get_mm_label(oi_change):
+    if oi_change is None:
+        return "⚪ NO OI DATA"
+    if oi_change > 8:
+        return "🔴 EXTREME LONG"
+    if oi_change > 4:
+        return "🟡 AGGRESSIVE LONG"
+    if oi_change > 1.5:
+        return "🟢 LONG BUILD-UP"
+    if oi_change < -8:
+        return "🔵 EXTREME SHORT"
+    if oi_change < -4:
+        return "🟣 AGGRESSIVE SHORT"
+    if oi_change < -1.5:
+        return "🔵 SHORT BUILD-UP"
     return "⚪ SIDEWAYS"
 
 # ================== TELEGRAM ==================
@@ -138,7 +162,7 @@ async def send_alert(text: str):
         session = await get_http_session()
         async with session.post(url, json=payload) as r:
             if r.status != 200:
-                log.error(f"Telegram API error: {r.status}")
+                log.error(f"Telegram error: {r.status}")
     except Exception as e:
         log.error(f"Telegram error: {e}")
 
@@ -148,25 +172,31 @@ async def classify_and_alert(symbol, side, total, price):
     oi_data = await get_binance_oi(symbol)
     
     if oi_data:
-        oi_str = f"{oi_data['change']:+.2f}%"
+        oi_change = oi_data["change"]
         oi_value = f"{oi_data['value']:,.0f}"
+        oi_str = f"{oi_change:+.2f}%"
     else:
-        oi_str = "N/A"
+        oi_change = None
         oi_value = "N/A"
+        oi_str = "N/A"
     
-    priority = priority_label(total, oi_data['change'] if oi_data else None)
-    mm = get_mm_label(oi_data)
+    priority = priority_label(total, oi_change)
+    mm = get_mm_label(oi_change)
     side_emoji = "🟢 LONG" if side == "LONG" else "🔴 SHORT"
     
     # Форматирование цены
-    if price < 1:
+    if price < 0.0001:
+        price_str = f"{price:.8f}"
+    elif price < 0.01:
         price_str = f"{price:.6f}"
-    elif price < 100:
+    elif price < 1:
         price_str = f"{price:.4f}"
-    else:
+    elif price < 100:
         price_str = f"{price:.2f}"
+    else:
+        price_str = f"{price:,.0f}"
     
-    msg = f"""{priority} <b>💥 BINANCE REKT</b>
+    msg = f"""{priority} <b>💥 BINANCE LIQUIDATION</b>
 
 <b>{symbol}</b>
 Side: {side_emoji}
@@ -176,7 +206,7 @@ Price: ${price_str}
 📊 OI Change: <code>{oi_str}</code>
 📈 OI Total: <code>{oi_value}</code>
 
-🧠 MM: <b>{mm}</b>
+🧠 Market: <b>{mm}</b>
 ⏱️ {time.strftime('%H:%M:%S')} UTC"""
     
     log.info(f"Alert: {symbol} ${total:,.0f} | OI: {oi_str}")
@@ -207,6 +237,8 @@ async def process_liquidation(symbol, side, usd_size, price):
         task = asyncio.create_task(classify_and_alert(symbol, side, total, price))
         alert_tasks.add(task)
         clusters[symbol].clear()
+        
+        log.info(f"Cluster: {symbol} {len(symbol_clusters)} liqs ${total:,.0f}")
 
 # ================== BINANCE WS ==================
 async def binance_ws():
@@ -234,6 +266,10 @@ async def binance_ws():
                             if not symbol:
                                 continue
                             
+                            # Пропускаем BTC и ETH если нужно
+                            # if symbol in ["BTCUSDT", "ETHUSDT"]:
+                            #     continue
+                            
                             price = float(o["ap"])
                             quantity = float(o["q"])
                             usd_size = price * quantity
@@ -241,7 +277,8 @@ async def binance_ws():
                             
                             await process_liquidation(symbol, side, usd_size, price)
                             
-                        except (json.JSONDecodeError, KeyError, ValueError):
+                        except (json.JSONDecodeError, KeyError, ValueError) as e:
+                            log.debug(f"WS parse error: {e}")
                             continue
                             
                     elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
@@ -255,7 +292,7 @@ async def binance_ws():
         await asyncio.sleep(reconnect_delay)
         reconnect_delay = min(reconnect_delay * 2, 30)
 
-# ================== WEB SERVER (ТОЛЬКО ДЛЯ RENDER PORT) ==================
+# ================== WEB SERVER (ТОЛЬКО ДЛЯ RENDER) ==================
 async def handle_ping(request):
     """Минимальный эндпоинт для Render"""
     return web.Response(text="active", status=200)
@@ -286,7 +323,6 @@ async def main():
     except asyncio.CancelledError:
         log.info("Shutting down...")
     finally:
-        # Очистка
         for task in alert_tasks:
             task.cancel()
         
