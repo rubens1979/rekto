@@ -65,9 +65,11 @@ def binance_oi_funding(symbol):
             timeout=5
         ).json()
 
+        # DEBUG (можешь убрать позже)
+        log.info(f"RAW OI {symbol}: {oi}")
+        log.info(f"RAW FUNDING {symbol}: {funding}")
+
         if not isinstance(oi, list) or len(oi) < 2:
-            return None, None
-        if not isinstance(funding, list) or len(funding) < 1:
             return None, None
 
         oi_change = (
@@ -76,7 +78,11 @@ def binance_oi_funding(symbol):
             / float(oi[-2]["sumOpenInterest"]) * 100
         )
 
-        return oi_change, float(funding[0]["fundingRate"])
+        funding_rate = None
+        if isinstance(funding, list) and len(funding) > 0:
+            funding_rate = float(funding[0]["fundingRate"])
+
+        return oi_change, funding_rate
 
     except Exception as e:
         log.error(f"Binance OI/Funding error {symbol}: {e}")
@@ -96,9 +102,14 @@ def priority_label(total, oi, funding):
 def classify_and_alert(symbol, side, total, price):
     oi, funding = binance_oi_funding(symbol)
 
-    # ❌ если нет данных — не шлём алерт
-    if oi is None or funding is None:
-        log.info(f"No OI/Funding data for {symbol}, skipping alert")
+    # ❌ если нет OI — не шлём
+    if oi is None:
+        log.info(f"No OI data for {symbol}, skipping alert")
+        return
+
+    # ❌ если нет funding — не шлём
+    if funding is None:
+        log.info(f"No funding data for {symbol}, skipping alert")
         return
 
     if abs(oi) < 2 and abs(funding) < 0.02:
