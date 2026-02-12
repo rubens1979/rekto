@@ -6,15 +6,14 @@ import requests
 import websockets
 import logging
 import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from collections import defaultdict
 from dotenv import load_dotenv
-from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # ================== LOGGING ==================
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    handlers=[logging.StreamHandler()]
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
 log = logging.getLogger("REKT_BOT")
 
@@ -29,19 +28,9 @@ CLUSTER_WINDOW = int(os.getenv("CLUSTER_WINDOW", 100))
 
 BINANCE_LIQ_WS = "wss://fstream.binance.com/ws/!forceOrder@arr"
 
-# ================== HTTP SERVER (для Render) ==================
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"REKT BOT is running")
-
-def run_http():
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), Handler)
-    log.info(f"HTTP server running on port {port}")
-    server.serve_forever()
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (rekt-bot)"
+}
 
 # ================== TELEGRAM ==================
 def send_alert(text: str):
@@ -65,17 +54,21 @@ def binance_oi_funding(symbol):
         oi = requests.get(
             f"{base}/futures/data/openInterestHist",
             params={"symbol": symbol, "period": "5m", "limit": 2},
+            headers=HEADERS,
             timeout=5
         ).json()
 
         funding = requests.get(
             f"{base}/fapi/v1/fundingRate",
             params={"symbol": symbol, "limit": 1},
+            headers=HEADERS,
             timeout=5
         ).json()
 
-        if len(oi) < 2:
-            return 0, 0
+        if not isinstance(oi, list) or len(oi) < 2:
+            return None, None
+        if not isinstance(funding, list) or len(funding) < 1:
+            return None, None
 
         oi_change = (
             (float(oi[-1]["sumOpenInterest"]) -
@@ -84,9 +77,10 @@ def binance_oi_funding(symbol):
         )
 
         return oi_change, float(funding[0]["fundingRate"])
+
     except Exception as e:
         log.error(f"Binance OI/Funding error {symbol}: {e}")
-        return 0, 0
+        return None, None
 
 # ================== CLASSIFIER ==================
 def priority_label(total, oi, funding):
@@ -101,6 +95,11 @@ def priority_label(total, oi, funding):
 
 def classify_and_alert(symbol, side, total, price):
     oi, funding = binance_oi_funding(symbol)
+
+    # ❌ если нет данных — не шлём алерт
+    if oi is None or funding is None:
+        log.info(f"No OI/Funding data for {symbol}, skipping alert")
+        return
 
     if abs(oi) < 2 and abs(funding) < 0.02:
         log.info(f"Filtered {symbol}: OI={oi:.2f}% Funding={funding:.4f}")
@@ -153,7 +152,7 @@ async def binance_ws():
     while True:
         try:
             log.info("Connecting to Binance WS...")
-            async with websockets.connect(BINANCE_LIQ_WS, ping_interval=20) as ws:
+            async with websockets.connect(BINANCE_LIQ_WS) as ws:
                 log.info("Binance WS connected")
 
                 async for raw in ws:
@@ -184,13 +183,27 @@ async def binance_ws():
             log.error(f"Binance WS error: {e}")
             await asyncio.sleep(5)
 
+# ================== HTTP SERVER (for Render) ==================
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"REKT BOT RUNNING")
+
+def run_http():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), Handler)
+    log.info(f"HTTP server running on port {port}")
+    server.serve_forever()
+
 # ================== MAIN ==================
 def run_bot():
-    log.info("BOT THREAD STARTED")
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(binance_ws())
 
 if __name__ == "__main__":
+    log.info("BOT THREAD STARTED")
     threading.Thread(target=run_bot, daemon=True).start()
     run_http()
