@@ -46,33 +46,35 @@ def send_alert(text: str):
     except Exception as e:
         log.error(f"Telegram error: {e}")
 
-# ================== OI ONLY (NO FUNDING) ==================
-def binance_oi(symbol):
+# ================== BYBIT OI ==================
+def bybit_oi(symbol):
     try:
-        base = "https://fapi.binance.com"
+        url = "https://api.bybit.com/v5/market/open-interest"
+        params = {
+            "category": "linear",
+            "symbol": symbol,
+            "intervalTime": "5min",
+            "limit": 2
+        }
 
-        oi = requests.get(
-            f"{base}/futures/data/openInterestHist",
-            params={"symbol": symbol, "period": "5m", "limit": 2},
-            headers=HEADERS,
-            timeout=5
-        ).json()
+        r = requests.get(url, params=params, headers=HEADERS, timeout=5).json()
 
-        log.info(f"RAW OI {symbol}: {oi}")
-
-        if not isinstance(oi, list) or len(oi) < 2:
+        if r.get("retCode") != 0:
+            log.error(f"Bybit OI error {symbol}: {r}")
             return None
 
-        oi_change = (
-            (float(oi[-1]["sumOpenInterest"]) -
-             float(oi[-2]["sumOpenInterest"]))
-            / float(oi[-2]["sumOpenInterest"]) * 100
-        )
+        data = r["result"]["list"]
+        if len(data) < 2:
+            return None
 
+        oi_now = float(data[0]["openInterest"])
+        oi_prev = float(data[1]["openInterest"])
+
+        oi_change = (oi_now - oi_prev) / oi_prev * 100
         return oi_change
 
     except Exception as e:
-        log.error(f"Binance OI error {symbol}: {e}")
+        log.error(f"Bybit OI exception {symbol}: {e}")
         return None
 
 # ================== CLASSIFIER ==================
@@ -85,7 +87,7 @@ def priority_label(total, oi):
     return ["⚠️ LOW", "🟢 MEDIUM", "🔴 HIGH", "💀 MAX"][min(score, 3)]
 
 def classify_and_alert(symbol, side, total, price):
-    oi = binance_oi(symbol)
+    oi = bybit_oi(symbol)
 
     # ❌ если нет OI — не шлём
     if oi is None:
@@ -107,12 +109,12 @@ def classify_and_alert(symbol, side, total, price):
     msg = f"""
 💀 <b>REKT ALERT</b> {priority}
 
-<b>{symbol}</b> (Binance)
+<b>{symbol}</b>
 Side: {side}
 Price: {price}
 
 💰 Size: ${total:,.0f}
-📊 OI: {oi:.2f}%
+📊 OI (Bybit): {oi:.2f}%
 
 🧠 MM: <b>{mm}</b>
 """
