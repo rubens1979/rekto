@@ -7,6 +7,7 @@ import logging
 from collections import defaultdict
 from dotenv import load_dotenv
 from aiohttp import web
+import re
 
 # ================== LOGGING ==================
 logging.basicConfig(
@@ -42,10 +43,16 @@ _funding_cache = {}
 async def get_http_session():
     global _http_session
     if _http_session is None:
+        connector = aiohttp.TCPConnector(
+            limit=20,
+            force_close=True,
+            enable_cleanup_closed=True,
+            ssl=False
+        )
         _http_session = aiohttp.ClientSession(
             headers=HEADERS,
-            timeout=aiohttp.ClientTimeout(total=10),
-            connector=aiohttp.TCPConnector(limit=20)
+            timeout=aiohttp.ClientTimeout(total=15),
+            connector=connector
         )
     return _http_session
 
@@ -57,7 +64,14 @@ async def close_http_session():
 
 # ================== BINANCE OI ==================
 def format_symbol_for_binance(symbol):
+    """Конвертирует символ в формат Binance"""
+    # Убираем суффиксы PERP, 2S, 3L и т.д.
+    symbol = re.sub(r'PERP$', '', symbol)
+    symbol = re.sub(r'\d+[SL]$', '', symbol)
+    
     if symbol.endswith('USDT'):
+        return symbol
+    elif symbol.endswith('BUSD'):
         return symbol
     elif symbol.endswith('USD'):
         return symbol
@@ -65,8 +79,10 @@ def format_symbol_for_binance(symbol):
         return f"{symbol}USDT"
 
 async def get_binance_oi(symbol):
+    """Получение Open Interest с Binance"""
     now = time.time()
     
+    # Проверка кэша
     if symbol in _oi_cache:
         value, timestamp = _oi_cache[symbol]
         if now - timestamp < OI_CACHE_TTL:
@@ -77,34 +93,49 @@ async def get_binance_oi(symbol):
     try:
         session = await get_http_session()
         
-        url = "https://fapi.binance.com/futures/data/openInterestHist"
-        params = {
-            "symbol": binance_symbol,
-            "period": "5m",
-            "limit": 2
-        }
+        # Используем только openInterest эндпоинт
+        url = "https://fapi.binance.com/fapi/v1/openInterest"
+        params = {"symbol": binance_symbol}
         
-        async with session.get(url, params=params) as r:
+        async with session.get(url, params=params, timeout=10) as r:
             if r.status != 200:
+                log.debug(f"OI API error for {binance_symbol}: {r.status}")
                 _oi_cache[symbol] = (None, now)
                 return None
             
             data = await r.json()
-            if len(data) < 2:
+            oi_current = float(data.get("openInterest", 0))
+            
+            if oi_current == 0:
                 _oi_cache[symbol] = (None, now)
                 return None
             
-            oi_now = float(data[0]["sumOpenInterest"])
-            oi_prev = float(data[1]["sumOpenInterest"])
+            # Получаем исторический OI
+            hist_url = "https://fapi.binance.com/futures/data/openInterestHist"
+            hist_params = {
+                "symbol": binance_symbol,
+                "period": "5m",
+                "limit": 2,
+                "contractType": "PERPETUAL"
+            }
             
-            if oi_prev > 0:
-                oi_change = (oi_now - oi_prev) / oi_prev * 100
-                result = round(oi_change, 2)
-            else:
-                result = 0.0
+            oi_change = 0.0
+            try:
+                async with session.get(hist_url, params=hist_params, timeout=10) as hr:
+                    if hr.status == 200:
+                        hist_data = await hr.json()
+                        if hist_data and len(hist_data) >= 2:
+                            oi_prev = float(hist_data[1]["sumOpenInterest"])
+                            if oi_prev > 0:
+                                oi_change = (oi_current - oi_prev) / oi_prev * 100
+                                oi_change = round(oi_change, 2)
+            except Exception as e:
+                log.debug(f"OI hist error for {binance_symbol}: {e}")
             
-            _oi_cache[symbol] = (result, now)
-            return result
+            _oi_cache[symbol] = (oi_change, now)
+            if oi_change != 0:
+                log.info(f"OI for {symbol}: {oi_change:+.2f}%")
+            return oi_change
         
     except Exception as e:
         log.debug(f"OI error {symbol}: {e}")
@@ -113,8 +144,10 @@ async def get_binance_oi(symbol):
 
 # ================== BINANCE FUNDING ==================
 async def get_binance_funding(symbol):
+    """Получение Funding Rate с Binance"""
     now = time.time()
     
+    # Проверка кэша
     if symbol in _funding_cache:
         value, timestamp = _funding_cache[symbol]
         if now - timestamp < FUNDING_CACHE_TTL:
@@ -125,20 +158,24 @@ async def get_binance_funding(symbol):
     try:
         session = await get_http_session()
         
+        # Используем premiumIndex эндпоинт
         url = "https://fapi.binance.com/fapi/v1/premiumIndex"
         params = {"symbol": binance_symbol}
         
-        async with session.get(url, params=params) as r:
+        async with session.get(url, params=params, timeout=10) as r:
             if r.status != 200:
+                log.debug(f"Funding API error for {binance_symbol}: {r.status}")
                 _funding_cache[symbol] = (None, now)
                 return None
             
             data = await r.json()
             funding = float(data.get("lastFundingRate", 0))
-            result = round(funding * 100, 4)
+            funding_percent = round(funding * 100, 4)
             
-            _funding_cache[symbol] = (result, now)
-            return result
+            _funding_cache[symbol] = (funding_percent, now)
+            if funding_percent != 0:
+                log.info(f"Funding for {symbol}: {funding_percent:+.4f}%")
+            return funding_percent
         
     except Exception as e:
         log.debug(f"Funding error {symbol}: {e}")
@@ -165,16 +202,23 @@ def get_mm_label(oi_change, funding):
     if oi_change is None:
         return "UNCLEAR"
     
-    if oi_change > 5:
+    if oi_change > 8:
+        return "AGGRESSIVE BUILD-UP"
+    elif oi_change > 4:
         return "POSITION BUILD-UP"
-    elif oi_change < -5:
+    elif oi_change > 1.5:
+        return "LONG INTEREST"
+    elif oi_change < -8:
+        return "AGGRESSIVE CLOSE-OUT"
+    elif oi_change < -4:
         return "POSITION CLOSE-OUT"
-    elif abs(funding) > 0.01:
-        return "FUNDING SPIKE"
+    elif oi_change < -1.5:
+        return "SHORT INTEREST"
     else:
         return "SIDEWAYS"
 
 async def send_alert(symbol, side, total, price):
+    # Получаем реальные данные
     oi_change = await get_binance_oi(symbol)
     funding = await get_binance_funding(symbol)
     
@@ -182,7 +226,12 @@ async def send_alert(symbol, side, total, price):
     priority = PRIORITY_EMOJI[priority_level]
     
     mm = get_mm_label(oi_change, funding)
-    side_emoji = "🟢 LONG" if side == "LONG" else "🔴 SHORT"
+    
+    # Эмодзи для сторон
+    if side == "SHORT":
+        side_emoji = "🟢 SHORT"
+    else:
+        side_emoji = "🔴 LONG"
     
     # Форматирование цены
     if price < 0.0001:
@@ -212,21 +261,22 @@ async def send_alert(symbol, side, total, price):
 Side: {side_emoji}
 Price: {price_str}
 
-- 💰 Size: <b>${total:,.0f}</b>
-- 💲 OI: {oi_str}
-- 💳 Funding: {funding_str}
+- 📏 Size: <b>${total:,.0f}</b>
+- 💰 OI: {oi_str}
+- 🔗 Funding: {funding_str}
 
 MM: <b>{mm}</b>
 {time.strftime('%H:%M')}"""
     
     log.info(f"Alert: {symbol} ${total:,.0f} | OI: {oi_str} | Funding: {funding_str}")
     
+    # Отправка в Telegram
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "HTML"}
     
     try:
         session = await get_http_session()
-        async with session.post(url, json=payload) as r:
+        async with session.post(url, json=payload, timeout=10) as r:
             if r.status != 200:
                 log.error(f"Telegram error: {r.status}")
     except Exception as e:
@@ -281,7 +331,11 @@ async def binance_ws():
                             price = float(o["ap"])
                             quantity = float(o["q"])
                             usd_size = price * quantity
-                            side = "LONG" if o["S"] == "SELL" else "SHORT"
+                            
+                            if o["S"] == "SELL":
+                                side = "LONG"
+                            else:
+                                side = "SHORT"
                             
                             await process_liquidation(symbol, side, usd_size, price)
                             
