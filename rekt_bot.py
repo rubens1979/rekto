@@ -22,148 +22,278 @@ TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID")
 MIN_LIQ_USD = float(os.getenv("MIN_LIQ_USD", 100))
 CLUSTER_WINDOW = int(os.getenv("CLUSTER_WINDOW", 60))
+OI_CACHE_TTL = int(os.getenv("OI_CACHE_TTL", 30))
 
 BINANCE_LIQ_WS = "wss://fstream.binance.com/ws/!forceOrder@arr"
+BINANCE_FUNDING_WS = "wss://fstream.binance.com/ws/!markPrice@arr"
 
-# Реалистичный заголовок браузера
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-    "Accept": "application/json"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json",
+    "Accept-Encoding": "gzip, deflate"
 }
 
-# ================== TELEGRAM ==================
-async def send_alert(text: str):
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, timeout=5) as r:
-                return await r.json()
-    except Exception as e:
-        log.error(f"Telegram error: {e}")
+# ================== GLOBAL RESOURCES ==================
+_http_session = None
+_oi_cache = {}
+_funding_cache = {}
 
-# ================== BYBIT OI (ASYNC) ==================
-async def get_bybit_oi(symbol):
-    url = "https://api.bybit.com/v5/market/open-interest"
-    params = {"category": "linear", "symbol": symbol, "intervalTime": "5min", "limit": 2}
+# ================== SESSION MANAGEMENT ==================
+async def get_http_session():
+    """Переиспользуемая HTTP сессия"""
+    global _http_session
+    if _http_session is None:
+        _http_session = aiohttp.ClientSession(
+            headers=HEADERS,
+            timeout=aiohttp.ClientTimeout(total=10),
+            connector=aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
+        )
+    return _http_session
+
+async def close_http_session():
+    """Закрытие сессии при остановке"""
+    global _http_session
+    if _http_session:
+        await _http_session.close()
+        _http_session = None
+
+# ================== BINANCE OI ==================
+async def get_binance_oi(symbol):
+    """Получение Open Interest с Binance"""
+    now = time.time()
+    
+    # Проверка кэша
+    if symbol in _oi_cache:
+        value, timestamp = _oi_cache[symbol]
+        if now - timestamp < OI_CACHE_TTL:
+            return value
     
     try:
-        async with aiohttp.ClientSession(headers=HEADERS) as session:
-            async with session.get(url, params=params, timeout=5) as r:
-                if r.status != 200:
-                    log.error(f"Bybit API error {r.status} for {symbol}")
-                    return None
-                
-                data = await r.json()
-                if data.get("retCode") != 0:
-                    return None
-
-                points = data["result"]["list"]
-                if len(points) < 2: return None
-
-                oi_now = float(points[0]["openInterest"])
-                oi_prev = float(points[1]["openInterest"])
-                return (oi_now - oi_prev) / oi_prev * 100
+        session = await get_http_session()
+        url = "https://fapi.binance.com/fapi/v1/openInterest"
+        params = {"symbol": symbol}
+        
+        async with session.get(url, params=params) as r:
+            if r.status != 200:
+                return None
+            
+            data = await r.json()
+            oi = float(data["openInterest"])
+            
+            # Нужно предыдущее значение для расчета изменения
+            # Получаем исторические данные
+            hist_url = "https://fapi.binance.com/futures/data/openInterestHist"
+            hist_params = {"symbol": symbol, "period": "5m", "limit": 2}
+            
+            async with session.get(hist_url, params=hist_params) as hr:
+                if hr.status == 200:
+                    hist_data = await hr.json()
+                    if len(hist_data) >= 2:
+                        oi_prev = float(hist_data[1]["sumOpenInterest"])
+                        oi_change = (oi - oi_prev) / oi_prev * 100
+                    else:
+                        oi_change = 0
+                else:
+                    oi_change = 0
+            
+            result = {"value": oi, "change": oi_change}
+            _oi_cache[symbol] = (result, now)
+            return result
+            
     except Exception as e:
-        log.error(f"OI Fetch exception: {e}")
+        log.debug(f"OI error for {symbol}: {e}")
         return None
 
-# ================== LOGIC ==================
-def priority_label(total, oi_val):
+# ================== PRIORITY & MM ==================
+PRIORITY_LABELS = ["⚠️ LOW", "🟢 MEDIUM", "🔴 HIGH", "💀 MAX"]
+
+def priority_label(total, oi_change=None):
     score = 0
     if total > 500_000: score += 1
     if total > 2_000_000: score += 1
-    if abs(oi_val) > 4: score += 1
-    return ["⚠️ LOW", "🟢 MEDIUM", "🔴 HIGH", "💀 MAX"][min(score, 3)]
+    if oi_change and abs(oi_change) > 5: score += 1
+    return PRIORITY_LABELS[min(score, 3)]
 
+def get_mm_label(oi_data):
+    if not oi_data:
+        return "⚪ NO DATA"
+    change = oi_data["change"]
+    if change > 5:
+        return "🔴 AGGRESSIVE LONG"
+    if change > 2:
+        return "🟡 LONG BUILD-UP"
+    if change < -5:
+        return "🔵 AGGRESSIVE SHORT"
+    if change < -2:
+        return "🟣 SHORT BUILD-UP"
+    return "⚪ SIDEWAYS"
+
+# ================== TELEGRAM ==================
+async def send_alert(text: str):
+    """Отправка сообщения в Telegram"""
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}
+    
+    try:
+        session = await get_http_session()
+        async with session.post(url, json=payload) as r:
+            if r.status != 200:
+                log.error(f"Telegram API error: {r.status}")
+    except Exception as e:
+        log.error(f"Telegram error: {e}")
+
+# ================== ALERT GENERATOR ==================
 async def classify_and_alert(symbol, side, total, price):
-    oi = await get_bybit_oi(symbol)
+    """Классификация и отправка алерта с OI"""
+    oi_data = await get_binance_oi(symbol)
     
-    # Бот не молчит при ошибке, а пишет N/A
-    oi_str = f"{oi:+.2f}%" if oi is not None else "⚠️ N/A"
-    oi_val = oi if oi is not None else 0
+    if oi_data:
+        oi_str = f"{oi_data['change']:+.2f}%"
+        oi_value = f"{oi_data['value']:,.0f}"
+    else:
+        oi_str = "N/A"
+        oi_value = "N/A"
     
-    mm = "⚪ UNKNOWN"
-    if oi is not None:
-        mm = "🔴 POS BUILD-UP" if oi > 2 else "🟢 POS CLOSE" if oi < -2 else "⚪ SIDEWAYS"
-
-    priority = priority_label(total, oi_val)
+    priority = priority_label(total, oi_data['change'] if oi_data else None)
+    mm = get_mm_label(oi_data)
     side_emoji = "🟢 LONG" if side == "LONG" else "🔴 SHORT"
-
-    msg = f"""
-{priority} <b>REKT ALERT</b>
+    
+    # Форматирование цены
+    if price < 1:
+        price_str = f"{price:.6f}"
+    elif price < 100:
+        price_str = f"{price:.4f}"
+    else:
+        price_str = f"{price:.2f}"
+    
+    msg = f"""{priority} <b>💥 BINANCE REKT</b>
 
 <b>{symbol}</b>
 Side: {side_emoji}
-Price: {price:,.4f}
+Price: ${price_str}
 
 💰 Size: <b>${total:,.0f}</b>
 📊 OI Change: <code>{oi_str}</code>
+📈 OI Total: <code>{oi_value}</code>
 
 🧠 MM: <b>{mm}</b>
-"""
-    log.info(f"Signal sent: {symbol} ${total:,.0f}")
+⏱️ {time.strftime('%H:%M:%S')} UTC"""
+    
+    log.info(f"Alert: {symbol} ${total:,.0f} | OI: {oi_str}")
     await send_alert(msg)
 
-# ================== AGGREGATOR ==================
+# ================== LIQUIDATION PROCESSOR ==================
 clusters = defaultdict(list)
+alert_tasks = set()
 
 async def process_liquidation(symbol, side, usd_size, price):
-    if usd_size < MIN_LIQ_USD: return
+    """Обработка ликвидации с кластеризацией"""
+    if usd_size < MIN_LIQ_USD:
+        return
 
     now = time.time()
-    clusters[symbol].append((now, usd_size, side, price))
-    clusters[symbol] = [x for x in clusters[symbol] if now - x[0] <= CLUSTER_WINDOW]
-
-    total = sum(x[1] for x in clusters[symbol])
-
+    window_start = now - CLUSTER_WINDOW
+    
+    symbol_clusters = clusters[symbol]
+    symbol_clusters[:] = [x for x in symbol_clusters if x[0] > window_start]
+    symbol_clusters.append((now, usd_size, side, price))
+    
+    total = sum(x[1] for x in symbol_clusters)
+    
     if total >= MIN_LIQ_USD * 3:
-        # Запускаем в фоне, чтобы не тормозить WS
-        asyncio.create_task(classify_and_alert(symbol, side, total, price))
+        # Очистка завершенных задач
+        alert_tasks.difference_update({t for t in alert_tasks if t.done()})
+        
+        task = asyncio.create_task(classify_and_alert(symbol, side, total, price))
+        alert_tasks.add(task)
         clusters[symbol].clear()
 
 # ================== BINANCE WS ==================
 async def binance_ws():
+    """WebSocket для ликвидаций Binance"""
+    reconnect_delay = 1
+    
     while True:
         try:
-            log.info("Connecting to Binance WS...")
-            async with aiohttp.ClientSession() as session:
-                async with session.ws_connect(BINANCE_LIQ_WS) as ws:
-                    log.info("Binance WS connected")
-                    async for msg in ws:
-                        if msg.type == aiohttp.WSMsgType.TEXT:
+            session = await get_http_session()
+            async with session.ws_connect(
+                BINANCE_LIQ_WS,
+                heartbeat=30,
+                compress=15
+            ) as ws:
+                log.info("✅ Binance WS connected")
+                reconnect_delay = 1
+                
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        try:
                             data = json.loads(msg.data)
                             o = data.get("o", {})
                             symbol = o.get("s")
-                            if not symbol or symbol.startswith(("BTC", "ETH")): continue
-
-                            usd = float(o["ap"]) * float(o["q"])
+                            
+                            if not symbol:
+                                continue
+                            
+                            price = float(o["ap"])
+                            quantity = float(o["q"])
+                            usd_size = price * quantity
                             side = "LONG" if o["S"] == "SELL" else "SHORT"
-                            await process_liquidation(symbol, side, usd, float(o["ap"]))
+                            
+                            await process_liquidation(symbol, side, usd_size, price)
+                            
+                        except (json.JSONDecodeError, KeyError, ValueError):
+                            continue
+                            
+                    elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
+                        break
+                        
+        except asyncio.CancelledError:
+            break
         except Exception as e:
             log.error(f"WS error: {e}")
-            await asyncio.sleep(5)
+        
+        await asyncio.sleep(reconnect_delay)
+        reconnect_delay = min(reconnect_delay * 2, 30)
 
-# ================== WEB SERVER (Render Port Binding) ==================
+# ================== WEB SERVER (ТОЛЬКО ДЛЯ RENDER PORT) ==================
 async def handle_ping(request):
-    return web.Response(text="BOT ACTIVE", status=200)
+    """Минимальный эндпоинт для Render"""
+    return web.Response(text="active", status=200)
 
 async def run_server():
+    """HTTP сервер только для привязки порта Render"""
     app = web.Application()
     app.router.add_get("/", handle_ping)
+    
     runner = web.AppRunner(app)
     await runner.setup()
+    
     port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
-    log.info(f"HTTP Server started on port {port}")
+    
+    log.info(f"HTTP server on port {port}")
     await site.start()
+    return runner
 
 # ================== MAIN ==================
 async def main():
-    await asyncio.gather(
-        run_server(),
-        binance_ws()
-    )
+    """Основная функция"""
+    server_runner = None
+    
+    try:
+        server_runner = await run_server()
+        await binance_ws()
+    except asyncio.CancelledError:
+        log.info("Shutting down...")
+    finally:
+        # Очистка
+        for task in alert_tasks:
+            task.cancel()
+        
+        await close_http_session()
+        
+        if server_runner:
+            await server_runner.cleanup()
 
 if __name__ == "__main__":
     try:
