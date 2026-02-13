@@ -23,14 +23,10 @@ load_dotenv()
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID")
 
-MIN_LIQ_USD = float(os.getenv("MIN_LIQ_USD", 30))
-CLUSTER_WINDOW = int(os.getenv("CLUSTER_WINDOW", 100))
+MIN_LIQ_USD = float(os.getenv("MIN_LIQ_USD", 1000))
+CLUSTER_WINDOW = int(os.getenv("CLUSTER_WINDOW", 60))
 
 BINANCE_LIQ_WS = "wss://fstream.binance.com/ws/!forceOrder@arr"
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (rekt-bot)"
-}
 
 # ================== TELEGRAM ==================
 def send_alert(text: str):
@@ -46,106 +42,6 @@ def send_alert(text: str):
     except Exception as e:
         log.error(f"Telegram error: {e}")
 
-# ================== LOAD OKX SYMBOLS ==================
-OKX_SYMBOLS = set()
-
-def load_okx_symbols():
-    global OKX_SYMBOLS
-    try:
-        url = "https://www.okx.com/api/v5/public/instruments"
-        params = {"instType": "SWAP"}
-        r = requests.get(url, params=params, headers=HEADERS, timeout=10).json()
-
-        if r.get("code") != "0":
-            log.error(f"Failed to load OKX instruments: {r}")
-            return
-
-        for item in r["data"]:
-            if item["instId"].endswith("-USDT-SWAP"):
-                sym = item["instId"].replace("-USDT-SWAP", "") + "USDT"
-                OKX_SYMBOLS.add(sym)
-
-        log.info(f"Loaded {len(OKX_SYMBOLS)} OKX symbols")
-
-    except Exception as e:
-        log.error(f"Error loading OKX symbols: {e}")
-
-# ================== OKX OI ==================
-def okx_oi(symbol):
-    try:
-        inst = symbol.replace("USDT", "-USDT-SWAP")
-
-        url = "https://www.okx.com/api/v5/public/open-interest"
-        params = {
-            "instType": "SWAP",
-            "instId": inst
-        }
-
-        r = requests.get(url, params=params, headers=HEADERS, timeout=5).json()
-
-        if r.get("code") != "0":
-            return None
-
-        lst = r.get("data", [])
-        if len(lst) < 2:
-            return None
-
-        oi_now = float(lst[0]["oi"])
-        oi_prev = float(lst[1]["oi"])
-
-        if oi_prev == 0:
-            return None
-
-        return (oi_now - oi_prev) / oi_prev * 100
-
-    except Exception:
-        return None
-
-# ================== CLASSIFIER ==================
-def priority_label(total, oi):
-    score = 0
-    if total > 5_000_000:
-        score += 2
-    if abs(oi) > 5:
-        score += 2
-    return ["⚠️ LOW", "🟢 MEDIUM", "🔴 HIGH", "💀 MAX"][min(score, 3)]
-
-def classify_and_alert(symbol, side, total, price):
-    if symbol not in OKX_SYMBOLS:
-        return
-
-    oi = okx_oi(symbol)
-
-    if oi is None:
-        return
-
-    if abs(oi) < 2:
-        log.info(f"Filtered {symbol}: OI={oi:.2f}%")
-        return
-
-    mm = (
-        "🔴 POSITION BUILD-UP" if oi > 3 else
-        "🟢 POSITION CLOSE" if oi < -3 else
-        "⚪ UNCLEAR"
-    )
-
-    priority = priority_label(total, oi)
-
-    msg = f"""
-💀 <b>REKT ALERT</b> {priority}
-
-<b>{symbol}</b>
-Side: {side}
-Price: {price}
-
-💰 Size: ${total:,.0f}
-📊 OI (OKX): {oi:.2f}%
-
-🧠 MM: <b>{mm}</b>
-"""
-    log.info(f"{symbol} | {priority} | {mm}")
-    send_alert(msg)
-
 # ================== AGGREGATOR ==================
 clusters = defaultdict(list)
 
@@ -155,13 +51,26 @@ def process_liquidation(symbol, side, usd_size, price):
 
     now = time.time()
     clusters[symbol].append((now, usd_size, side, price))
-    clusters[symbol] = [x for x in clusters[symbol] if now - x[0] <= CLUSTER_WINDOW]
+
+    clusters[symbol] = [
+        x for x in clusters[symbol]
+        if now - x[0] <= CLUSTER_WINDOW
+    ]
 
     total = sum(x[1] for x in clusters[symbol])
 
-    if total >= MIN_LIQ_USD * 4:
+    if total >= MIN_LIQ_USD * 3:
+        msg = f"""
+💀 <b>LIQUIDATION ALERT</b>
+
+<b>{symbol}</b>
+Side: {side}
+Price: {price}
+
+💰 Cluster size: ${total:,.0f}
+"""
         log.info(f"Cluster {symbol} ${total:,.0f}")
-        classify_and_alert(symbol, side, total, price)
+        send_alert(msg)
         clusters[symbol].clear()
 
 # ================== BINANCE WS ==================
@@ -183,19 +92,21 @@ async def binance_ws():
                         o = e["o"]
                         symbol = o["s"]
 
-                        if symbol.startswith(("BTC", "ETH")):
-                            continue
-
                         usd = float(o["ap"]) * float(o["q"])
                         side = "LONG" if o["S"] == "SELL" else "SHORT"
 
-                        process_liquidation(symbol, side, usd, float(o["ap"]))
+                        process_liquidation(
+                            symbol,
+                            side,
+                            usd,
+                            float(o["ap"])
+                        )
 
         except Exception as e:
             log.error(f"Binance WS error: {e}")
             await asyncio.sleep(5)
 
-# ================== HTTP SERVER ==================
+# ================== HTTP SERVER (for Render) ==================
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -216,9 +127,6 @@ def run_bot():
     loop.run_until_complete(binance_ws())
 
 if __name__ == "__main__":
-    log.info("LOADING OKX SYMBOLS...")
-    load_okx_symbols()
-
-    log.info("BOT THREAD STARTED")
+    log.info("BOT THREAD STARTED (BINANCE LIQUIDATIONS ONLY)")
     threading.Thread(target=run_bot, daemon=True).start()
     run_http()
