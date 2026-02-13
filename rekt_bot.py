@@ -23,8 +23,8 @@ load_dotenv()
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID")
 
-MIN_LIQ_USD = float(os.getenv("MIN_LIQ_USD", 1000))
-CLUSTER_WINDOW = int(os.getenv("CLUSTER_WINDOW", 60))
+MIN_LIQ_USD = float(os.getenv("MIN_LIQ_USD", 2000))
+CLUSTER_WINDOW = int(os.getenv("CLUSTER_WINDOW", 1000))
 
 BINANCE_LIQ_WS = "wss://fstream.binance.com/ws/!forceOrder@arr"
 
