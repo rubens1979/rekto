@@ -5,11 +5,10 @@ import asyncio
 import requests
 import websockets
 import logging
+import threading
 from collections import defaultdict
 from dotenv import load_dotenv
-
-from fastapi import FastAPI
-import uvicorn
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # ================== LOGGING (FILE ONLY) ==================
 logging.basicConfig(
@@ -31,6 +30,25 @@ MIN_LIQ_USD = float(os.getenv("MIN_LIQ_USD", 300))
 CLUSTER_WINDOW = int(os.getenv("CLUSTER_WINDOW", 30))
 
 BINANCE_LIQ_WS = "wss://fstream.binance.com/ws/!forceOrder@arr"
+
+# ================== SIMPLE HTTP SERVER for Render health check ==================
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK - Rekt Bot is running")
+
+    def log_message(self, format, *args):
+        # Отключаем стандартные логи сервера, чтобы не засорять консоль
+        return
+
+def run_http_server():
+    port = int(os.environ.get("PORT", 10000))
+    server_address = ('0.0.0.0', port)
+    httpd = HTTPServer(server_address, HealthHandler)
+    log.info(f"HTTP health server started on 0.0.0.0:{port}")
+    httpd.serve_forever()
 
 # ================== TELEGRAM ==================
 def send_alert(text: str):
@@ -149,31 +167,16 @@ async def binance_ws():
             log.error(f"Binance WS error: {e}")
             await asyncio.sleep(5)
 
-# ================== FASTAPI HEALTH ==================
-app = FastAPI(title="Rekt Bot Health")
-
-@app.get("/health")
-@app.get("/")
-async def health_check():
-    return {"status": "ok", "service": "rekt-bot", "uptime": time.time()}
-
 # ================== MAIN ==================
-async def main():
-    log.info("REKT BOT STARTED (BINANCE ONLY + HTTP health)")
+def main():
+    log.info("REKT BOT STARTED (BINANCE ONLY + minimal HTTP)")
 
-    # Запускаем websocket-клиент в фоне
-    asyncio.create_task(binance_ws())
+    # Запускаем HTTP-сервер в отдельном потоке
+    http_thread = threading.Thread(target=run_http_server, daemon=True)
+    http_thread.start()
 
-    # Запускаем uvicorn-сервер (он блокирует, поэтому после create_task)
-    config = uvicorn.Config(
-        app,
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", 10000)),
-        log_level="info",
-        workers=1
-    )
-    server = uvicorn.Server(config)
-    await server.serve()
+    # Запускаем asyncio loop с websocket-клиентом
+    asyncio.run(binance_ws())
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
