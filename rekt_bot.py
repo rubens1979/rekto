@@ -154,7 +154,7 @@ def process_liquidation(symbol: str, side: str, usd_size: float, price: float):
     if usd_size < MIN_LIQ_USD:
         return
 
-    now = time.time.now()
+    now = time.time()
     clusters[symbol].append((now, usd_size, side, price))
     clusters[symbol] = [x for x in clusters[symbol] if now - x[0] <= CLUSTER_WINDOW]
 
