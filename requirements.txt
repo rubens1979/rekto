@@ -2,3 +2,5 @@ websockets
 requests
 python-dotenv
 aiohttp
+fastapi
+uvicorn
