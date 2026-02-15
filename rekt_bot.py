@@ -8,7 +8,6 @@ import logging
 import threading
 import signal
 import sys
-from datetime import datetime
 from collections import defaultdict
 from dotenv import load_dotenv
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -155,7 +154,7 @@ def process_liquidation(symbol: str, side: str, usd_size: float, price: float):
     if usd_size < MIN_LIQ_USD:
         return
 
-    now = datetime.now()
+    now = time.now()
     clusters[symbol].append((now, usd_size, side, price))
     clusters[symbol] = [x for x in clusters[symbol] if now - x[0] <= CLUSTER_WINDOW]
 
